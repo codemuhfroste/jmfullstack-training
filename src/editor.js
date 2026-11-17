@@ -1,9 +1,9 @@
 /**
- * editor.js — the larger code editor panel (CodeMirror 6 with PHP highlighting).
+ * editor.js — a CodeMirror 6 code editor with highlighting for every
+ * language the courses teach.
  *
- * The panel is a plain <section> in index.html that we show/hide. Only one
- * action is "primary": in exercise mode Ctrl+Enter submits the tests, in REPL
- * mode it runs the code. Esc closes the panel.
+ * The caller owns the surrounding markup and buttons; this module only
+ * provides the editing surface plus Ctrl/Cmd+Enter.
  */
 
 import { EditorView, keymap } from '@codemirror/view';
@@ -11,88 +11,76 @@ import { EditorState, Prec } from '@codemirror/state';
 import { indentWithTab } from '@codemirror/commands';
 import { indentUnit } from '@codemirror/language';
 import { basicSetup } from 'codemirror';
+import { html } from '@codemirror/lang-html';
+import { css } from '@codemirror/lang-css';
+import { javascript } from '@codemirror/lang-javascript';
 import { php } from '@codemirror/lang-php';
+import { sql, SQLite } from '@codemirror/lang-sql';
 import { oneDark } from '@codemirror/theme-one-dark';
+
+const LANGUAGES = {
+  html: () => html(),
+  css: () => css(),
+  javascript: () => javascript(),
+  php: () => php(),
+  sql: () => sql({ dialect: SQLite, upperCaseKeywords: true }),
+};
+
+/** Let the app's own surface colour show through the One Dark theme. */
+const appTheme = EditorView.theme(
+  {
+    '&': { backgroundColor: 'transparent', height: '100%' },
+    '.cm-gutters': { backgroundColor: 'transparent', border: 'none' },
+    '.cm-scroller': { fontFamily: 'var(--font-mono)', lineHeight: '1.55' },
+    '&.cm-focused': { outline: 'none' },
+  },
+  { dark: true },
+);
 
 /**
  * @param {object} options
- * @param {HTMLElement} options.panel
- * @param {HTMLElement} options.host         where CodeMirror mounts
- * @param {HTMLElement} options.titleEl
- * @param {HTMLButtonElement} options.runButton
- * @param {HTMLButtonElement} options.submitButton
- * @param {HTMLButtonElement} options.closeButton
- * @param {(code: string) => void} options.onRun
- * @param {(code: string) => void} options.onSubmit
- * @param {() => void} [options.onClose]
+ * @param {HTMLElement} options.parent        element the editor mounts into
+ * @param {string} [options.doc]              initial code
+ * @param {'html'|'css'|'javascript'|'php'|'sql'} [options.lang]
+ * @param {boolean} [options.readOnly]
+ * @param {() => void} [options.onSubmit]     Ctrl/Cmd+Enter
+ * @param {(code: string) => void} [options.onChange]
  */
-export function createEditor({ panel, host, titleEl, runButton, submitButton, closeButton, onRun, onSubmit, onClose }) {
-  let primary = 'run'; // 'run' | 'submit' — what Ctrl+Enter does
+export function createCodeEditor({ parent, doc = '', lang = 'php', readOnly = false, onSubmit, onChange }) {
+  const extensions = [
+    // Highest precedence so our shortcut wins over basicSetup's defaults.
+    Prec.highest(keymap.of([{ key: 'Mod-Enter', run: () => (onSubmit?.(), true) }])),
+    basicSetup,
+    keymap.of([indentWithTab]),
+    indentUnit.of(lang === 'php' ? '    ' : '  '),
+    (LANGUAGES[lang] || LANGUAGES.php)(),
+    appTheme,
+    oneDark,
+    EditorView.lineWrapping,
+  ];
+
+  if (readOnly) extensions.push(EditorState.readOnly.of(true), EditorView.editable.of(false));
+
+  if (onChange) {
+    extensions.push(
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) onChange(update.state.doc.toString());
+      }),
+    );
+  }
 
   const view = new EditorView({
-    parent: host,
-    state: EditorState.create({
-      doc: '',
-      extensions: [
-        // Highest precedence so our shortcuts win over basicSetup's.
-        Prec.highest(
-          keymap.of([
-            { key: 'Mod-Enter', run: () => (triggerPrimary(), true) },
-            { key: 'Escape', run: () => (close(), true) },
-          ]),
-        ),
-        basicSetup,
-        keymap.of([indentWithTab]),
-        indentUnit.of('    '),
-        php(),
-        oneDark,
-        EditorView.lineWrapping,
-      ],
-    }),
+    parent,
+    state: EditorState.create({ doc, extensions }),
   });
 
-  function getCode() {
-    return view.state.doc.toString();
-  }
-
-  function setCode(code) {
-    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: code } });
-  }
-
-  function triggerPrimary() {
-    if (primary === 'submit') onSubmit(getCode());
-    else onRun(getCode());
-  }
-
-  /**
-   * Show the panel.
-   * @param {{ title?: string, code?: string, primary?: 'run'|'submit' }} options
-   */
-  function open({ title = 'editor', code, primary: primaryAction = 'run' } = {}) {
-    primary = primaryAction;
-    titleEl.textContent = title;
-    submitButton.hidden = primaryAction !== 'submit';
-    if (typeof code === 'string') setCode(code);
-    panel.hidden = false;
-    document.body.classList.add('editor-open');
-    // Focus after the panel is laid out so the caret is visible.
-    requestAnimationFrame(() => view.focus());
-  }
-
-  function close() {
-    if (panel.hidden) return;
-    panel.hidden = true;
-    document.body.classList.remove('editor-open');
-    onClose?.();
-  }
-
-  function isOpen() {
-    return !panel.hidden;
-  }
-
-  runButton.addEventListener('click', () => onRun(getCode()));
-  submitButton.addEventListener('click', () => onSubmit(getCode()));
-  closeButton.addEventListener('click', close);
-
-  return { open, close, isOpen, getCode, setCode, focus: () => view.focus() };
+  return {
+    view,
+    getCode: () => view.state.doc.toString(),
+    setCode(code) {
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: code } });
+    },
+    focus: () => view.focus(),
+    destroy: () => view.destroy(),
+  };
 }

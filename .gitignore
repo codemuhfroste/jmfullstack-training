@@ -18,3 +18,9 @@ Thumbs.db
 
 # Vercel local metadata
 .vercel/
+
+# Secrets and the local development database
+.env
+.env.*
+!.env.example
+.data/

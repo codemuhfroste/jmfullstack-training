@@ -1,122 +1,142 @@
 /**
  * main.js — wires the pieces together.
  *
- *   Terminal (UI)  ──►  commands.js  ──►  Repl  ──►  PhpRunner  ──►  php-worker.js (WebAssembly PHP)
- *                                    └──►  exercises.js (test harness)
+ *   router ──► pages/home.js        dashboard: level, streak, the courses
+ *          ──► pages/course.js      a course as a path of lessons
+ *          ──► pages/lesson.js      learn + editor + checks ──► runners/
+ *          ──► pages/playground.js  ungraded scratchpad      ──► runners/
+ *          ──► pages/reviewer.js    study notes per course
+ *          ──► pages/profile.js     stats, badges, settings
+ *
+ *          ──► pages/leaderboard.js everyone with an account, by XP
+ *
+ *   store.js (progress, XP, badges) ◄── every page
+ *   account.js (login, sync)        ──► /api/* (Vercel functions) ──► Turso
+ *   courses/ (lesson data)          ◄── store, pages
+ *
+ *   runners/web.js         sandboxed iframe      HTML, CSS, DOM lessons
+ *   runners/javascript.js  Web Worker            JavaScript logic lessons
+ *   runners/php.js         PHP 8.4 WebAssembly   via php-runner.js ► php-worker.js
+ *   runners/sql.js         SQLite WebAssembly    via sql.js
  */
 
 import './style.css';
-import { Terminal } from './terminal.js';
 import { PhpRunner } from './php-runner.js';
 import { Repl } from './repl.js';
-import { createEditor } from './editor.js';
-import { createCommands } from './commands.js';
-import { loadState, saveState } from './storage.js';
+import { createStore } from './store.js';
+import { createAccount } from './account.js';
+import { createRouter } from './router.js';
+import { courses } from './courses/index.js';
+import { el, setChildren, icon, avatar } from './ui.js';
+import { homePage } from './pages/home.js';
+import { coursePage } from './pages/course.js';
+import { lessonPage } from './pages/lesson.js';
+import { playgroundPage } from './pages/playground.js';
+import { profilePage } from './pages/profile.js';
+import { reviewerIndexPage, reviewerPage } from './pages/reviewer.js';
+import { leaderboardPage } from './pages/leaderboard.js';
 
-// Written as an array of plain strings: a template literal would need the
-// backtick and backslashes escaped, which makes ASCII art unreadable.
-const BANNER = [
-  '  ___  _  _  ___   _____          _',
-  ' | _ \\| || || _ \\ |_   _| _ _ __ _ (_) _ _   ___  _ _',
-  " |  _/| __ ||  _/   | |  | '_/ _` || || ' \\ / -_)| '_|",
-  ' |_|  |_||_||_|     |_|  |_| \\__,_||_||_||_|\\___||_|',
-].join('\n');
-
-// ---------------------------------------------------------------------------
-// Persistent state (progress + history), with a single save() helper.
-// ---------------------------------------------------------------------------
-const state = loadState();
-const save = () => saveState(state);
-
-// ---------------------------------------------------------------------------
-// Terminal
-// ---------------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 
-// Commands are created after the terminal, but the terminal needs callbacks
-// that reach them. These two `let`s close that loop.
-let commands;
-let inputQueue = Promise.resolve(); // serialises submitted inputs
+// ---------------------------------------------------------------------------
+// Shared services
+// ---------------------------------------------------------------------------
+const store = createStore();
+const account = createAccount(store);
 
-const term = new Terminal({
-  root: $('terminal'),
-  screen: $('screen'),
-  output: $('output'),
-  promptEl: $('prompt'),
-  input: $('input'),
-  history: state.history,
-  onSubmit: (text) => {
-    state.history = term.getHistory();
-    save();
-    inputQueue = inputQueue.then(() => commands.handleInput(text)).catch(console.error);
+// PHP is a 20 MB download, so it is only started when a PHP lesson, the PHP
+// playground or the PHP console is opened.
+let php = null;
+let repl = null;
+const getPhp = () => (php ??= new PhpRunner({ timeoutMs: 5000 }));
+const getRepl = () => (repl ??= new Repl(getPhp()));
+
+// ---------------------------------------------------------------------------
+// Top bar
+// ---------------------------------------------------------------------------
+const NAV = [
+  { route: '/', label: 'Learn', icon: 'home', match: (path) => path === '/' || path.startsWith('/course') || path.startsWith('/lesson') },
+  { route: '/reviewer', label: 'Reviewer', icon: 'book', match: (path) => path.startsWith('/reviewer') },
+  { route: '/playground', label: 'Playground', icon: 'code', match: (path) => path.startsWith('/playground') },
+  { route: '/leaderboard', label: 'Leaderboard', icon: 'trophy', match: (path) => path.startsWith('/leaderboard') },
+];
+
+$('brand-mark').append(icon('layers', 20));
+const navLinks = NAV.map((item) => el('a', { href: `#${item.route}` }, icon(item.icon, 18), el('span', {}, item.label)));
+$('nav').append(...navLinks);
+
+function renderTopStats() {
+  const level = store.level();
+  const streak = store.streak();
+  setChildren(
+    $('top-stats'),
+    el('span', { class: `stat-chip streak ${store.activeToday() ? 'lit' : ''}`, title: streak ? `${streak}-day streak` : 'No streak yet. Run some code today.' }, el('span', { 'aria-hidden': 'true' }, '🔥'), streak, el('span', { class: 'sr-only' }, ' day streak')),
+    el('span', { class: 'stat-chip xp', title: `${store.xp()} XP in total` }, icon('bolt', 15), store.xp(), el('span', { class: 'sr-only' }, ' XP')),
+    account.status.available && !account.status.user ? el('a', { class: 'stat-chip login', href: '#/profile' }, 'Log in') : null,
+    el(
+      'a',
+      { class: 'stat-chip level', href: '#/profile', title: `Your profile · Level ${level.level} ${level.title}`, 'aria-label': 'Your profile' },
+      avatar(store.state.profile, 'sm'),
+      el('span', { class: 'level-text' }, `Lv ${level.level}`),
+    ),
+  );
+}
+store.subscribe(renderTopStats);
+account.subscribe(renderTopStats);
+renderTopStats();
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+const ctx = { store, account, php: getPhp, repl: getRepl, router: null };
+
+const pageName = (path) => (path.startsWith('/lesson') ? 'lesson' : path.startsWith('/playground') ? 'playground' : path.startsWith('/course') ? 'course' : path.startsWith('/profile') ? 'profile' : path.startsWith('/reviewer') ? 'reviewer' : path.startsWith('/leaderboard') ? 'leaderboard' : 'home');
+
+const router = createRouter(
+  [
+    { pattern: /^\/$/, page: (params) => homePage(params, ctx) },
+    { pattern: /^\/course\/(?<id>[^/]+)$/, page: (params) => coursePage(params, ctx) },
+    { pattern: /^\/lesson\/(?<course>[^/]+)\/(?<id>[^/]+)$/, page: (params) => lessonPage(params, ctx) },
+    { pattern: /^\/playground(?:\/(?<mode>[^/]+))?$/, page: (params) => playgroundPage(params, ctx) },
+    { pattern: /^\/reviewer$/, page: (params) => reviewerIndexPage(params, ctx) },
+    { pattern: /^\/reviewer\/(?<id>[^/]+)$/, page: (params) => reviewerPage(params, ctx) },
+    { pattern: /^\/leaderboard$/, page: (params) => leaderboardPage(params, ctx) },
+    { pattern: /^\/profile$/, page: (params) => profilePage(params, ctx) },
+  ],
+  {
+    outlet: $('app'),
+    onNavigate(path) {
+      NAV.forEach((item, i) => {
+        const on = item.match(path);
+        navLinks[i].classList.toggle('active', on);
+        if (on) navLinks[i].setAttribute('aria-current', 'page');
+        else navLinks[i].removeAttribute('aria-current');
+      });
+      // Lets CSS give the lesson and playground pages a full-height layout.
+      document.body.dataset.page = pageName(path);
+      renderTopStats();
+    },
   },
-  onComplete: (before) => commands.complete(before),
+);
+ctx.router = router;
+router.start();
+
+// Find out whether someone is logged in. If their saved progress was merged
+// in, the page on screen is out of date, so draw it again.
+account.init().then((status) => {
+  if (status.user) router.go(location.hash.replace(/^#/, '') || '/');
 });
-
-term.print(BANNER, 'banner');
-term.print('Practice PHP in a fake shell. The PHP is real (WebAssembly); the server is not.', 'sys');
-const bootLine = term.print('Booting PHP runtime...', 'sys');
-
-// ---------------------------------------------------------------------------
-// PHP runtime (in a Web Worker) + REPL session
-// ---------------------------------------------------------------------------
-const php = new PhpRunner({
-  timeoutMs: 5000,
-  onStatus: (message) => term.updateLine(bootLine, message, 'sys'),
-});
-
-php.ready
-  .then(({ version }) => {
-    term.updateLine(bootLine, `PHP ${version} ready.`, 'ok');
-    term.print('Type `help` to get started.', 'hint');
-  })
-  .catch((err) => {
-    term.updateLine(bootLine, `Failed to boot PHP: ${err.message}`, 'err');
-    term.print('Reload the page to retry. A recent Chrome, Firefox, Safari or Edge is required.', 'sys');
-  });
-
-const repl = new Repl(php);
-
-// ---------------------------------------------------------------------------
-// Editor panel
-// ---------------------------------------------------------------------------
-const editor = createEditor({
-  panel: $('editor-panel'),
-  host: $('editor-host'),
-  titleEl: $('editor-title'),
-  runButton: $('editor-run'),
-  submitButton: $('editor-submit'),
-  closeButton: $('editor-close'),
-  onRun: (code) => {
-    inputQueue = inputQueue.then(() => commands.runFromEditor(code)).catch(console.error);
-  },
-  onSubmit: () => {
-    inputQueue = inputQueue.then(() => commands.submitFromEditor()).catch(console.error);
-  },
-  onClose: () => term.focus(),
-});
-
-// ---------------------------------------------------------------------------
-// Commands
-// ---------------------------------------------------------------------------
-commands = createCommands({ term, php, repl, editor, state, save });
-
-term.focus();
 
 // Small debugging hook (also used by the automated browser test):
-//   phpTrainer.exec('echo 1+1;')   run a line as if typed
-//   phpTrainer.setCode('...')      replace the editor contents
-//   phpTrainer.output()            everything currently on screen
-window.phpTrainer = {
-  exec(text) {
-    // Go through the real input path so history, echo and queueing behave
-    // exactly as if the text had been typed.
-    term.setInput(text);
-    term.submit();
-    return inputQueue;
-  },
-  setCode: (code) => editor.setCode(code),
-  getCode: () => editor.getCode(),
-  output: () => $('output').innerText,
-  ready: php.ready,
+//   fst.router.go('/lesson/php/03-fizzbuzz')
+//   fst.page().setFile('main.php', '<?php ...'); fst.page().check()
+//   await fst.verify()    // run every lesson's solution and starter code
+window.fst = {
+  store,
+  account,
+  router,
+  courses,
+  php: getPhp,
+  page: () => router.currentPage,
+  verify: (options) => import('./verify.js').then((module) => module.verifyAll(ctx, options)),
 };

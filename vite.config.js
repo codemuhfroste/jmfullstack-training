@@ -1,4 +1,7 @@
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
+import { existsSync, statSync } from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 /**
  * The PHP build we ship, written the way the `@php-wasm/web-X-Y` package
@@ -44,18 +47,70 @@ function stubUnusedPhpAssets() {
       return `
         export default '';
         export function getPHPLoaderModule() {
-          throw new Error('This PHP build is not bundled with PHP Terminal Trainer.');
+          throw new Error('This PHP build is not bundled with FSTraining.');
         }
         export function getIntlExtensionPath() {
-          throw new Error('The intl extension is not bundled with PHP Terminal Trainer.');
+          throw new Error('The intl extension is not bundled with FSTraining.');
         }
       `;
     },
   };
 }
 
+/**
+ * Vite plugin: serve the Vercel functions in ./api during `npm run dev` and
+ * `npm run preview`, so accounts work locally without the Vercel CLI.
+ *
+ * /api/auth/login → ./api/auth/login.js, called with the plain Node request
+ * and response, exactly as Vercel does. Variables from .env.local are copied
+ * into process.env for the routes (the browser never sees them).
+ */
+function localApi() {
+  const SERVER_VARIABLES = ['TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN', 'SIGNUP_CODE'];
+
+  const mount = (server) => {
+    server.middlewares.use(async (req, res, next) => {
+      const { pathname } = new URL(req.url, 'http://localhost');
+      if (!pathname.startsWith('/api/')) return next();
+
+      const name = pathname.slice('/api/'.length).replace(/\/+$/, '');
+      const file = path.resolve('api', `${name}.js`);
+      // Only plain route names; "_lib" and friends are private, as on Vercel.
+      const valid = /^[a-z0-9-]+(\/[a-z0-9-]+)*$/.test(name) && existsSync(file);
+
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      if (!valid) {
+        res.statusCode = 404;
+        return res.end(JSON.stringify({ error: 'Not found.' }));
+      }
+      try {
+        // The modified time in the URL reloads a route after it is edited.
+        const module = await import(`${pathToFileURL(file).href}?v=${statSync(file).mtimeMs}`);
+        await module.default(req, res);
+      } catch (err) {
+        console.error('[local-api]', err);
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: 'The local API crashed. See the terminal.' }));
+      }
+    });
+  };
+
+  return {
+    name: 'local-api',
+    config(_config, { mode }) {
+      const env = loadEnv(mode, process.cwd(), '');
+      for (const key of SERVER_VARIABLES) if (env[key] && !process.env[key]) process.env[key] = env[key];
+    },
+    configureServer: mount,
+    configurePreviewServer: mount,
+  };
+}
+
 export default defineConfig({
-  plugins: [stubUnusedPhpAssets()],
+  plugins: [stubUnusedPhpAssets(), localApi()],
+
+  // The local database file changes on every request; it is not source code.
+  server: { watch: { ignored: ['**/.data/**'] } },
 
   // These binary files are imported by @php-wasm/web with `import` syntax.
   // Telling Vite they are assets makes the import resolve to a URL.
@@ -76,6 +131,8 @@ export default defineConfig({
       '@php-wasm/util',
       '@wp-playground/common',
       'wasm-feature-detect',
+      // sql.js ships as CommonJS/UMD as well.
+      'sql.js',
     ],
   },
 
